@@ -1,15 +1,23 @@
 import os
 try:
-    from PyQt6.QtCore import QTimer, QRect
+    from PyQt6.QtCore import QTimer, QRect, Qt
     from PyQt6.QtGui import QAction
-    from PyQt6.QtWidgets import QMenu, QMainWindow
+    from PyQt6.QtWidgets import QMenu, QMainWindow, QApplication
 except ImportError:
-    from PyQt5.QtCore import QTimer, QRect
-    from PyQt5.QtWidgets import QMenu, QMainWindow, QAction
+    from PyQt5.QtCore import QTimer, QRect, Qt
+    from PyQt5.QtWidgets import QMenu, QMainWindow, QAction, QApplication
 
 from krita import Extension, Krita
 from .config import load_config
 from .settings_dialog import SettingsDialog
+
+def is_drawing_or_mouse_down():
+    try:
+        btns = QApplication.mouseButtons()
+        no_btn = getattr(Qt.MouseButton, "NoButton", None) if hasattr(Qt, "MouseButton") else getattr(Qt, "NoButton", 0)
+        return btns != no_btn
+    except Exception:
+        return False
 
 class InfiniteCanvasExtension(Extension):
     def __init__(self, parent):
@@ -29,6 +37,9 @@ class InfiniteCanvasExtension(Extension):
         self.action_exp_right = None
         self.action_exp_top = None
         self.action_exp_bottom = None
+
+        self.auto_crop_pending_undo = False
+        self.connected_undo_actions = set()
 
     def setup(self):
         notifier = Krita.instance().notifier()
@@ -74,6 +85,12 @@ class InfiniteCanvasExtension(Extension):
         qwin = window.qwindow()
         if not qwin or not isinstance(qwin, QMainWindow):
             return
+
+        # 绑定 Undo 动作，实现 Ctrl+Z 联动撤销
+        action_undo = qwin.findChild(QAction, "edit_undo")
+        if action_undo and id(action_undo) not in self.connected_undo_actions:
+            action_undo.triggered.connect(self._on_undo_triggered)
+            self.connected_undo_actions.add(id(action_undo))
 
         menu_bar = qwin.menuBar()
         if not menu_bar:
@@ -143,7 +160,7 @@ class InfiniteCanvasExtension(Extension):
         elif direction == "top" and h + step <= max_size:
             doc.crop(0, -step, w, h + step)
         elif direction == "bottom" and h + step <= max_size:
-            doc.crop(0, 0, w, h + step)
+            doc.crop(0, 0, w + step, h)
         doc.refreshProjection()
 
     def open_settings(self):
@@ -171,7 +188,6 @@ class InfiniteCanvasExtension(Extension):
             if node.visible():
                 node_type = node.type()
                 name = node.name().lower()
-                # 过滤掉背景图层与填充图层
                 is_bg = "background" in name or "背景" in name or "底色" in name or node_type == "filllayer"
                 if not is_bg and node_type in ("paintlayer", "vectorlayer", "filelayer"):
                     bounds = node.bounds()
@@ -183,7 +199,6 @@ class InfiniteCanvasExtension(Extension):
 
         rects = _get_paint_rects(root)
 
-        # 回退逻辑：如果未找到非背景图层，则尝试当前活动图层
         if not rects:
             active = doc.activeNode()
             if active and not active.bounds().isEmpty():
@@ -205,14 +220,34 @@ class InfiniteCanvasExtension(Extension):
         new_w = union_rect.width() + 2 * padding
         new_h = union_rect.height() + 2 * padding
 
-        # 只有在有效缩小或重定位时裁剪
         if new_w < doc_w or new_h < doc_h or new_x != 0 or new_y != 0:
             doc.crop(new_x, new_y, new_w, new_h)
             doc.refreshProjection()
 
+    def _on_undo_triggered(self):
+        if self.is_active and self.auto_crop_pending_undo:
+            self.auto_crop_pending_undo = False
+            QTimer.singleShot(10, self._perform_chained_undo)
+
+    def _perform_chained_undo(self):
+        window = Krita.instance().activeWindow()
+        if not window:
+            return
+        qwin = window.qwindow()
+        if not qwin:
+            return
+        action_undo = qwin.findChild(QAction, "edit_undo")
+        if action_undo:
+            action_undo.trigger()
+
     def _check_canvas_expansion(self):
         if not self.is_active:
             return
+
+        # 若画师正在绘制笔触（按住鼠标/数位笔），暂缓扩充，等笔触抬起后再触发
+        if is_drawing_or_mouse_down():
+            return
+
         doc = Krita.instance().activeDocument()
         if not doc:
             return
@@ -248,3 +283,5 @@ class InfiniteCanvasExtension(Extension):
             new_h = doc_h + exp_t + exp_b
             doc.crop(new_x, new_y, new_w, new_h)
             doc.refreshProjection()
+            # 标记自动扩充，用于 Ctrl+Z 联动撤销
+            self.auto_crop_pending_undo = True
