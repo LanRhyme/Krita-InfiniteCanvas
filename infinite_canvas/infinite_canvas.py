@@ -1,5 +1,4 @@
 import os
-import time
 try:
     from PyQt6.QtCore import QTimer, QRect, Qt
     from PyQt6.QtGui import QAction
@@ -39,7 +38,9 @@ class InfiniteCanvasExtension(Extension):
         self.action_exp_top = None
         self.action_exp_bottom = None
 
-        self.undo_cooldown_until = 0
+        self.was_mouse_down = False
+        self.stroke_dirty = False
+        self.auto_crop_pending_undo = False
         self.connected_undo_actions = set()
 
     def setup(self):
@@ -87,7 +88,7 @@ class InfiniteCanvasExtension(Extension):
         if not qwin or not isinstance(qwin, QMainWindow):
             return
 
-        # 绑定 Undo 动作，实现 Ctrl+Z 撤销后冷却防死循环
+        # 绑定 Undo 动作，实现 Ctrl+Z 联动撤销
         action_undo = qwin.findChild(QAction, "edit_undo")
         if action_undo and id(action_undo) not in self.connected_undo_actions:
             action_undo.triggered.connect(self._on_undo_triggered)
@@ -138,7 +139,8 @@ class InfiniteCanvasExtension(Extension):
 
     def toggle_mode(self, checked):
         self.is_active = checked
-        self.undo_cooldown_until = 0
+        self.stroke_dirty = False
+        self.was_mouse_down = False
         if checked:
             self.timer.setInterval(self.config.get("check_interval", 200))
             self.timer.start()
@@ -227,19 +229,41 @@ class InfiniteCanvasExtension(Extension):
             doc.refreshProjection()
 
     def _on_undo_triggered(self):
-        # 用户执行 Ctrl+Z 撤销时激活 2.5s 扩充冷却期，确保画师可以连续顺畅撤销笔画而不会被后台定时器重新扩充
-        self.undo_cooldown_until = time.time() + 2.5
+        # 发生 Undo 时彻底清空脏笔触标志，防止撤销引发重新扩充死循环
+        self.stroke_dirty = False
+        if self.is_active and self.auto_crop_pending_undo:
+            self.auto_crop_pending_undo = False
+            QTimer.singleShot(10, self._perform_chained_undo)
+
+    def _perform_chained_undo(self):
+        window = Krita.instance().activeWindow()
+        if not window:
+            return
+        qwin = window.qwindow()
+        if not qwin:
+            return
+        action_undo = qwin.findChild(QAction, "edit_undo")
+        if action_undo:
+            action_undo.trigger()
 
     def _check_canvas_expansion(self):
         if not self.is_active:
             return
 
-        # 若画师正在绘制笔触或拖动图像，立即解除撤销冷却，保障实时边画/边移边扩
-        if is_drawing_or_mouse_down():
-            self.undo_cooldown_until = 0
+        mouse_down = is_drawing_or_mouse_down()
 
-        # 如果处于撤销冷却期内，跳过自动扩充
-        if time.time() < self.undo_cooldown_until:
+        # 1. 检测笔触按下
+        if mouse_down:
+            self.was_mouse_down = True
+            self.stroke_dirty = True
+            return
+
+        # 2. 检测笔触抬起
+        if self.was_mouse_down and not mouse_down:
+            self.was_mouse_down = False
+
+        # 3. 只有真正绘制了新笔触才允许触发扩充；撤销/浏览时绝对不扩充
+        if not self.stroke_dirty:
             return
 
         doc = Krita.instance().activeDocument()
@@ -277,3 +301,7 @@ class InfiniteCanvasExtension(Extension):
             new_h = doc_h + exp_t + exp_b
             doc.crop(new_x, new_y, new_w, new_h)
             doc.refreshProjection()
+            
+            # 扩充后重置脏标志，防止重复或死循环
+            self.stroke_dirty = False
+            self.auto_crop_pending_undo = True
