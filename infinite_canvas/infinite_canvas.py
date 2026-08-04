@@ -38,6 +38,8 @@ class InfiniteCanvasExtension(Extension):
         self.action_exp_top = None
         self.action_exp_bottom = None
 
+        self.was_mouse_down = False
+        self.stroke_dirty = False
         self.auto_crop_pending_undo = False
         self.connected_undo_actions = set()
 
@@ -137,6 +139,8 @@ class InfiniteCanvasExtension(Extension):
 
     def toggle_mode(self, checked):
         self.is_active = checked
+        self.stroke_dirty = False
+        self.was_mouse_down = False
         if checked:
             self.timer.setInterval(self.config.get("check_interval", 200))
             self.timer.start()
@@ -160,7 +164,7 @@ class InfiniteCanvasExtension(Extension):
         elif direction == "top" and h + step <= max_size:
             doc.crop(0, -step, w, h + step)
         elif direction == "bottom" and h + step <= max_size:
-            doc.crop(0, 0, w + step, h)
+            doc.crop(0, 0, w, h + step)
         doc.refreshProjection()
 
     def open_settings(self):
@@ -225,6 +229,8 @@ class InfiniteCanvasExtension(Extension):
             doc.refreshProjection()
 
     def _on_undo_triggered(self):
+        # 发生 Undo 时彻底清空脏笔触标志，防止撤销引发重新扩充死循环
+        self.stroke_dirty = False
         if self.is_active and self.auto_crop_pending_undo:
             self.auto_crop_pending_undo = False
             QTimer.singleShot(10, self._perform_chained_undo)
@@ -244,8 +250,20 @@ class InfiniteCanvasExtension(Extension):
         if not self.is_active:
             return
 
-        # 若画师正在绘制笔触（按住鼠标/数位笔），暂缓扩充，等笔触抬起后再触发
-        if is_drawing_or_mouse_down():
+        mouse_down = is_drawing_or_mouse_down()
+
+        # 1. 检测笔触按下
+        if mouse_down:
+            self.was_mouse_down = True
+            self.stroke_dirty = True
+            return
+
+        # 2. 检测笔触抬起
+        if self.was_mouse_down and not mouse_down:
+            self.was_mouse_down = False
+
+        # 3. 只有真正绘制了新笔触才允许触发扩充；撤销/浏览时绝对不扩充
+        if not self.stroke_dirty:
             return
 
         doc = Krita.instance().activeDocument()
@@ -283,5 +301,7 @@ class InfiniteCanvasExtension(Extension):
             new_h = doc_h + exp_t + exp_b
             doc.crop(new_x, new_y, new_w, new_h)
             doc.refreshProjection()
-            # 标记自动扩充，用于 Ctrl+Z 联动撤销
+            
+            # 扩充后重置脏标志，防止重复或死循环
+            self.stroke_dirty = False
             self.auto_crop_pending_undo = True
